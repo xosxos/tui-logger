@@ -33,7 +33,7 @@ pub fn tracing_subscriber_layer(buffer_size: usize) -> TuiLogger {
     })
 }
 
-struct ExtLogRecord {
+struct Record {
     timestamp: DateTime<Local>,
     level: tracing::Level,
     target: String,
@@ -59,7 +59,7 @@ where
         let mut visitor = tracing_visitor::ToStringVisitor::default();
         event.record(&mut visitor);
           
-        let record = ExtLogRecord {
+        let record = Record {
             timestamp: chrono::Local::now(),
             level: *event.metadata().level(),
             target: event.metadata().target().to_string(),
@@ -73,7 +73,7 @@ where
 }
 
 
-pub struct TuiLoggerWidget<'b> {
+pub struct LogWidget<'b> {
     block: Option<Block<'b>>,
     style: Style,
     style_error: Option<Style>,
@@ -85,9 +85,9 @@ pub struct TuiLoggerWidget<'b> {
     format_timestamp: Option<String>,
 }
 
-impl<'b> Default for TuiLoggerWidget<'b> {
-    fn default() -> TuiLoggerWidget<'b> {
-        TuiLoggerWidget {
+impl<'b> Default for LogWidget<'b> {
+    fn default() -> LogWidget<'b> {
+        LogWidget {
             style: Style::default(),
             style_error: None,
             style_warn: None,
@@ -100,22 +100,22 @@ impl<'b> Default for TuiLoggerWidget<'b> {
     }
 }
 
-impl<'b> TuiLoggerWidget<'b> {
-    fn format_record(&self, evt: &ExtLogRecord) -> String {
+impl<'b> LogWidget<'b> {
+    fn format_record(&self, record: &Record) -> String {
         let mut output = String::new();
         
         if let Some(fmt) = self.format_timestamp.as_ref() {
-            output.push_str(&format!("{}", evt.timestamp.format(fmt)));
+            output.push_str(&format!("{}", record.timestamp.format(fmt)));
             output.push(self.format_separator);
         }
         
-        output.push_str(evt.level.to_string());
+        output.push_str(record.level.to_string());
         output.push(self.format_separator);
         
-        if evt.level == tracing::Level::ERROR {
-            output.push_str(&evt.file);
+        if record.level == tracing::Level::ERROR {
+            output.push_str(&record.file);
             output.push(self.format_separator);
-            output.push_str(&format!("{}", evt.line));
+            output.push_str(&format!("{}", record.line));
             output.push(self.format_separator);
         }
         
@@ -123,22 +123,18 @@ impl<'b> TuiLoggerWidget<'b> {
     }
 }
 
-impl<'b> Widget for TuiLoggerWidget<'b> {
+impl<'b> Widget for LogWidget<'b> {
     fn render(mut self, list_area: Rect, buf: &mut Buffer) {
-        buf.set_style(area, self.style);
-        
+        // Define sizes
         let indent = 9;
-        
-        if list_area.width < indent + 4 || list_area.height < 1 {
-            return;
-        }
-        
         let la_left = list_area.left();
         let la_top = list_area.top();
         let la_width = list_area.width as usize;
         let la_height = list_area.height as usize;
-        
         let rem_width = la_width - indent as usize;
+
+        // Set style
+        buf.set_style(area, self.style);
 
         // Raw string lines
         let mut lines: Vec<(Option<Style>, u16, String)> = vec![];
@@ -175,13 +171,14 @@ impl<'b> Widget for TuiLoggerWidget<'b> {
 
         // Drop the lock
         drop(tui_lock);
+
         
         // lines is a vector with bottom line at index 0
         // wrapped_lines will be a vector with top line first
         let mut wrapped_lines = CircularBuffer::new(la_height);
         
+        // Word wrap
         while let Some((style, left, line)) = lines.pop() {
-            // Word wrap
             if line.chars().count() > la_width {
                 wrapped_lines.push((style, left, line.chars().take(la_width).collect()));
                 
