@@ -1,9 +1,5 @@
 //! # Logger with smart widget for the `tui` and `ratatui` crate
 
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#[macro_use]
-extern crate lazy_static;
-
 use std::collections::hash_map::Iter;
 use std::collections::hash_map::Keys;
 use std::collections::HashMap;
@@ -26,7 +22,16 @@ use ratatui::{
 };
 
 pub use crate::circular::CircularBuffer;
-pub use crate::tracing_subscriber::TuiTracingSubscriberLayer;
+
+use std::sync::OnceLock;
+
+static TUI_LOGGER: OnceLock<TuiLogger> = OnceLock::new();
+
+pub fn tracing_subscriber_layer(buffer_size: usize) -> TuiLogger {
+    TUI_LOGGER.get_or_init(|| TuiLogger {
+        records: CircularBuffer::new(buffer_size),
+    })
+}
 
 struct ExtLogRecord {
     timestamp: DateTime<Local>,
@@ -38,9 +43,7 @@ struct ExtLogRecord {
 }
 
 struct TuiLogger {
-    events: Mutex<CircularBuffer<ExtLogRecord>>,
-    dump: Option<File>,
-    default: LevelFilter,
+    records: Mutex<CircularBuffer<ExtLogRecord>>,
 }
 
 // Implement tracing layer
@@ -61,40 +64,14 @@ where
             level: *event.metadata().level(),
             target: event.metadata().target().to_string(),
             file: event.metadata().file().unwrap_or("?").to_string(),
-            //.module_path(event.metadata().module_path())
             line: event.metadata().line().unwrap_or(0),
             msg: format_args!("{}", visitor)),
         };
         
-        self.inner.lock().events.push(record); 
+        self.records.lock().push(record); 
     }
 }
 
-
-lazy_static! {
-    static ref TUI_LOGGER: TuiLogger = {
-        TuiLogger {
-            events: Mutex::new(CircularBuffer::new(10000)),
-            dump: None,
-            default: LevelFilter::Info,
-        }
-    };
-}
-
-pub fn tracing_subscriber_layer() -> TuiTracingSubscriberLayer {
-    TuiTracingSubscriberLayer
-}
-
-/// Set the depth of the circular buffer in order to avoid message loss.
-/// This will delete all existing messages in the circular buffer.
-pub fn set_buffer_depth(depth: usize) {
-    TUI_LOGGER.inner.lock().events = CircularBuffer::new(depth);
-}
-
-/// Set default levelfilter for unknown targets of the logger
-pub fn set_default_level(levelfilter: LevelFilter) {
-    TUI_LOGGER.inner.lock().default = levelfilter;
-}
 
 pub struct TuiLoggerWidget<'b> {
     block: Option<Block<'b>>,
@@ -107,11 +84,11 @@ pub struct TuiLoggerWidget<'b> {
     format_separator: char,
     format_timestamp: Option<String>,
 }
+
 impl<'b> Default for TuiLoggerWidget<'b> {
     fn default() -> TuiLoggerWidget<'b> {
         TuiLoggerWidget {
-            block: None,
-            style: Default::default(),
+            style: Style::default(),
             style_error: None,
             style_warn: None,
             style_debug: None,
@@ -119,21 +96,13 @@ impl<'b> Default for TuiLoggerWidget<'b> {
             style_info: None,
             format_separator: ':',
             format_timestamp: Some("%H:%M:%S".to_string()),
-            state: Arc::new(Mutex::new(TuiWidgetInnerState::new())),
         }
     }
 }
+
 impl<'b> TuiLoggerWidget<'b> {
-    fn format_event(&self, evt: &ExtLogRecord) -> (String, Option<Style>) {
+    fn format_record(&self, evt: &ExtLogRecord) -> String {
         let mut output = String::new();
-        
-        let col_style = match evt.level {
-            tracing::Level::ERROR => self.style_error,
-            tracing::Level::WARN => self.style_warn,
-            tracing::Level::INFO => self.style_info,
-            tracing::Level::DEBUG => self.style_debug,
-            tracing::Level::TRACE => self.style_trace,
-        };
         
         if let Some(fmt) = self.format_timestamp.as_ref() {
             output.push_str(&format!("{}", evt.timestamp.format(fmt)));
@@ -150,20 +119,13 @@ impl<'b> TuiLoggerWidget<'b> {
             output.push(self.format_separator);
         }
         
-        (output, col_style)
+        output
     }
 }
 
 impl<'b> Widget for TuiLoggerWidget<'b> {
-    fn render(mut self, area: Rect, buf: &mut Buffer) {
+    fn render(mut self, list_area: Rect, buf: &mut Buffer) {
         buf.set_style(area, self.style);
-        
-        let list_area = self.block.take()
-            .map_or(area, |b| {
-                let inner_area = b.inner(area);
-                b.render(area, buf);
-                inner_area
-        });
         
         let indent = 9;
         
@@ -177,58 +139,74 @@ impl<'b> Widget for TuiLoggerWidget<'b> {
         let la_height = list_area.height as usize;
         
         let rem_width = la_width - indent as usize;
-        
+
+        // Raw string lines
         let mut lines: Vec<(Option<Style>, u16, String)> = vec![];
-        {
-           // Get events
-            let mut tui_lock = TUI_LOGGER.inner.lock();
-            for evt in tui_lock.events.rev_iter() {               
-                let (mut output, col_style) = self.format_event(evt);
+
+        // Get the lock
+        let mut tui_lock = TUI_LOGGER.get().unwrap().records.lock();
+
+        // Loop records
+        for record in tui_lock.records.rev_iter() {
+            let col_style = match record.level {
+                tracing::Level::ERROR => self.style_error,
+                tracing::Level::WARN => self.style_warn,
+                tracing::Level::INFO => self.style_info,
+                tracing::Level::DEBUG => self.style_debug,
+                tracing::Level::TRACE => self.style_trace,
+            };
                 
-                let mut sublines: Vec<&str> = evt.msg.lines().rev().collect();
+            let mut output = self.format_record(record);
                 
-                output.push_str(sublines.pop().unwrap());
+            let mut sublines: Vec<&str> = record.msg.lines().rev().collect();
                 
-                for subline in sublines {
-                    lines.push((col_style, indent, subline.to_string()));
-                }
+            output.push_str(sublines.pop().unwrap());
                 
-                lines.push((col_style, 0, output));
+            for subline in sublines {
+                lines.push((col_style, indent, subline.to_string()));
+            }
                 
-                if lines.len() == la_height {
-                    break;
-                }
+             lines.push((col_style, 0, output));
+                
+            if lines.len() == la_height {
+                break;
             }
         }
+
+        // Drop the lock
+        drop(tui_lock);
         
         // lines is a vector with bottom line at index 0
         // wrapped_lines will be a vector with top line first
         let mut wrapped_lines = CircularBuffer::new(la_height);
         
-
-        
         while let Some((style, left, line)) = lines.pop() {
+            // Word wrap
             if line.chars().count() > la_width {
                 wrapped_lines.push((style, left, line.chars().take(la_width).collect()));
+                
                 let mut remain: String = line.chars().skip(la_width).collect();
+                
                 while remain.chars().count() > rem_width {
                     let remove: String = remain.chars().take(rem_width).collect();
                     wrapped_lines.push((style, indent, remove));
                     remain = remain.chars().skip(rem_width).collect();
                 }
+                
                 wrapped_lines.push((style, indent, remain.to_owned()));
             } else {
                 wrapped_lines.push((style, left, line));
             }
         }
 
-        for (i, (sty, left, l)) in wrapped_lines.iter().enumerate() {
-            buf.set_stringn(
+        // Write records to the Widgets buffer
+        for (i, (style, left, line)) in wrapped_lines.iter().enumerate() {
+            buf.set_string(
                 la_left + left,
                 la_top + i as u16,
-                l,
-                l.len(),
-                sty.unwrap_or(self.style),
+                line,
+                line.len(),
+                style.unwrap_or(self.style),
             );
         }
     }
