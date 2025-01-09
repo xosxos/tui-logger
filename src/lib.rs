@@ -30,66 +30,56 @@ pub use crate::tracing_subscriber::TuiTracingSubscriberLayer;
 
 struct ExtLogRecord {
     timestamp: DateTime<Local>,
-    level: Level,
+    level: tracing::Level,
     target: String,
     file: String,
     line: u32,
     msg: String,
 }
 
-struct TuiLoggerInner {
-    events: CircularBuffer<ExtLogRecord>,
-    total_events: usize,
+struct TuiLogger {
+    events: Mutex<CircularBuffer<ExtLogRecord>>,
     dump: Option<File>,
     default: LevelFilter,
 }
-struct TuiLogger {
-    inner: Mutex<TuiLoggerInner>,
+
+// Implement tracing layer
+impl<S> tracing_subscriber::Layer<S> for TuiLogger
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = tracing_visitor::ToStringVisitor::default();
+        event.record(&mut visitor);
+          
+        let record = ExtLogRecord {
+            timestamp: chrono::Local::now(),
+            level: *event.metadata().level(),
+            target: event.metadata().target().to_string(),
+            file: event.metadata().file().unwrap_or("?").to_string(),
+            //.module_path(event.metadata().module_path())
+            line: event.metadata().line().unwrap_or(0),
+            msg: format_args!("{}", visitor)),
+        };
+        
+        self.inner.lock().events.push(record); 
+    }
 }
+
 
 lazy_static! {
     static ref TUI_LOGGER: TuiLogger = {
-        let tli = TuiLoggerInner {
-            events: CircularBuffer::new(10000),
-            total_events: 0,
+        TuiLogger {
+            events: Mutex::new(CircularBuffer::new(10000)),
             dump: None,
             default: LevelFilter::Info,
-        };
-        TuiLogger {
-            inner: Mutex::new(tli),
         }
     };
 }
-
-// Lots of boilerplate code, so that init_logger can return two error types...
-#[derive(Debug)]
-pub enum TuiLoggerError {
-    SetLoggerError(SetLoggerError),
-    ThreadError(std::io::Error),
-}
-impl std::error::Error for TuiLoggerError {
-    fn description(&self) -> &str {
-        match self {
-            TuiLoggerError::SetLoggerError(_) => "SetLoggerError",
-            TuiLoggerError::ThreadError(_) => "ThreadError",
-        }
-    }
-    fn cause(&self) -> Option<&dyn std::error::Error> {
-        match self {
-            TuiLoggerError::SetLoggerError(_) => None,
-            TuiLoggerError::ThreadError(err) => Some(err),
-        }
-    }
-}
-impl std::fmt::Display for TuiLoggerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TuiLoggerError::SetLoggerError(err) => write!(f, "SetLoggerError({})", err),
-            TuiLoggerError::ThreadError(err) => write!(f, "ThreadError({})", err),
-        }
-    }
-}
-
 
 pub fn tracing_subscriber_layer() -> TuiTracingSubscriberLayer {
     TuiTracingSubscriberLayer
@@ -104,27 +94,6 @@ pub fn set_buffer_depth(depth: usize) {
 /// Set default levelfilter for unknown targets of the logger
 pub fn set_default_level(levelfilter: LevelFilter) {
     TUI_LOGGER.inner.lock().default = levelfilter;
-}
-
-impl TuiLogger {
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            self.raw_log(record)
-        }
-    }
-    
-    fn raw_log(&self, record: &Record) {
-        let log_entry = ExtLogRecord {
-            timestamp: chrono::Local::now(),
-            level: record.level(),
-            target: record.target().to_string(),
-            file: record.file().unwrap_or("?").to_string(),
-            line: record.line().unwrap_or(0),
-            msg: format!("{}", record.args()),
-        };
-        let mut events_lock = self.inner.lock();
-        events_lock.events.push(log_entry);
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -455,11 +424,11 @@ impl<'b> TuiLoggerWidget<'b> {
     fn format_event(&self, evt: &ExtLogRecord) -> (String, Option<Style>) {
         let mut output = String::new();
         let (col_style, lev_long, lev_abbr, with_loc) = match evt.level {
-            log::Level::Error => (self.style_error, "ERROR", "E", true),
-            log::Level::Warn => (self.style_warn, "WARN ", "W", true),
-            log::Level::Info => (self.style_info, "INFO ", "I", false),
-            log::Level::Debug => (self.style_debug, "DEBUG", "D", true),
-            log::Level::Trace => (self.style_trace, "TRACE", "T", true),
+            tracing::Level::ERROR => (self.style_error, "ERROR", "E", true),
+            tracing::Level::WARN => (self.style_warn, "WARN ", "W", true),
+            tracing::Level::INFO => (self.style_info, "INFO ", "I", false),
+            tracing::Level::DEBUG => (self.style_debug, "DEBUG", "D", true),
+            tracing::Level::TRACE => (self.style_trace, "TRACE", "T", true),
         };
         if let Some(fmt) = self.format_timestamp.as_ref() {
             output.push_str(&format!("{}", evt.timestamp.format(fmt)));
@@ -604,14 +573,10 @@ impl<'b> Widget for TuiLoggerWidget<'b> {
     }
 }
 
-pub mod tracing_subscriber {
+pub mod tracing_visitor {
     //! `tracing-subscriber` support for `tui-logger`
-
-use super::TUI_LOGGER;
-use log::{self, Log, Record};
 use std::collections::HashMap;
 use std::fmt;
-use tracing_subscriber::Layer;
 
 #[derive(Default)]
 struct ToStringVisitor<'a>(HashMap<&'a str, String>);
@@ -662,41 +627,6 @@ impl<'a> tracing::field::Visit for ToStringVisitor<'a> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         self.0
             .insert(field.name(), format_args!("{:?}", value).to_string());
-    }
-}
-
-pub struct TuiTracingSubscriberLayer;
-
-impl<S> Layer<S> for TuiTracingSubscriberLayer
-where
-    S: tracing::Subscriber,
-{
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = ToStringVisitor::default();
-        event.record(&mut visitor);
-
-        let level = match *event.metadata().level() {
-            tracing::Level::ERROR => log::Level::Error,
-            tracing::Level::WARN => log::Level::Warn,
-            tracing::Level::INFO => log::Level::Info,
-            tracing::Level::DEBUG => log::Level::Debug,
-            tracing::Level::TRACE => log::Level::Trace,
-        };
-
-        TUI_LOGGER.log(
-            &Record::builder()
-                .args(format_args!("{}", visitor))
-                .level(level)
-                .target(event.metadata().target())
-                .file(event.metadata().file())
-                .line(event.metadata().line())
-                .module_path(event.metadata().module_path())
-                .build(),
-        );
     }
 }
 }
